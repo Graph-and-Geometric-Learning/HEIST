@@ -83,7 +83,7 @@ class GraphEncoder(nn.Module):
             high_emb = high_emb_new + high_emb
             low_emb = low_emb_new + low_emb
         # high_emb, low_emb = self.convs[-1](high_emb+high_emb_in, high_level_graph, low_emb+low_emb_in, low_level_graphs)
-        return self.norm(high_emb), self.norm(low_emb)#, aux_loss
+        return self.projection_head(self.norm(high_emb)), self.projection_head(self.norm(low_emb))#, aux_loss
 
     def encode(self, high_level_graph, low_level_graphs, gene_mask = None):
         if gene_mask is not None:
