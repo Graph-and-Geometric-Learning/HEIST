@@ -247,27 +247,10 @@ dependencies:
       - torch-geometric==2.6.1
       - torchaudio==2.7.1+cu128
       - torchinfo==1.8.0
-      - torchmetrics==1.8.0
-      - torchvision==0.22.1+cu128
-      - tqdm==4.67.1
-      - traitlets==5.14.3
-      - triton==3.3.1
-      - typing-extensions==4.12.2
-      - typing-inspection==0.4.1
-      - tzdata==2025.2
-      - umap-learn==0.5.9.post2
-      - url-normalize==2.2.1
-      - urllib3==2.5.0
-      - wadler-lindig==0.1.7
-      - wandb==0.15.12
-      - wcwidth==0.2.13
-      - webdataset==1.0.2
-      - wget==3.2
-      - widgetsnbextension==4.0.14
-      - wrapt==1.17.2
-      - xarray==2025.6.1
-      - xmltodict==0.14.2
-      - yapf==0.43.0
-      - yarl==1.20.1
-      - zope-event==5.1.1
-      - zope-interface==7.2
+      - tqdm==4.66.5
+      - tzdata==2024.2
+      - umap-learn==0.5.6
+      - webdataset==0.2.111
+      - wrapt==1.16.0
+      - yarl==1.15.4
+prefix: /home/hm638/.conda/envs/SCGFM
