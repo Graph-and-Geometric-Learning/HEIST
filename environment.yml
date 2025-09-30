@@ -253,4 +253,3 @@ dependencies:
       - webdataset==0.2.111
       - wrapt==1.16.0
       - yarl==1.15.4
-prefix: /home/hm638/.conda/envs/SCGFM
