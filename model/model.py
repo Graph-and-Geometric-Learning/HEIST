@@ -2,31 +2,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from torch_geometric.nn import TransformerConv, GINConv, GINEConv
+from torch_geometric.nn import TransformerConv, GINConv
 from torch_geometric.nn.pool import global_mean_pool
-from torch_geometric.utils import get_laplacian
 import numpy as np
-from torch_scatter import scatter
 import torch_geometric as tg
 import matplotlib.pyplot as plt
-from model.layers import MultiLevelGraphLayer, HierarchicalBlending, HeirarchicalBlendingWavelet
-from model.pe import calculate_sinusoidal_pe, calculate_anchor_pe
-
-def get_dirichlet_energy_normalised(hidden, edge_index): 
-    deg = tg.utils.degree(edge_index[0])
-    deg = torch.sqrt(deg + torch.ones_like(deg))
-    deg = deg.to(hidden.device)
-    
-    diff = (hidden/deg[:,None])[edge_index[0]] - (hidden/deg[:,None])[edge_index[1]]
-    dist = torch.norm(diff, dim=-1)**2
-    neigh_sum = scatter(dist, edge_index[0], dim=0, reduce='sum')
-    
-    batch = torch.zeros(neigh_sum.size(0)).long()
-    batch = batch.to(neigh_sum.device)
-    
-    neigh_sum = neigh_sum.unsqueeze(-1)
-    
-    return torch.sqrt(global_mean_pool(neigh_sum, batch=batch)).cpu().detach().item()
+from model.layers import MultiLevelGraphLayer, HierarchicalBlending
+from model.pe import calculate_sinusoidal_pe
 
 class GraphEncoder(nn.Module):
     def __init__(self, pe_dim, init_dim, hidden_dim, output_dim, num_layers, num_heads, cross_message_passing, positional_encoding, blending):
