@@ -4,8 +4,8 @@ warnings.filterwarnings('ignore')
 import torch
 import random
 from utils.dataloader import create_dataloader
-from model.model import GraphEncoder, GIN_decoder#, infoNCE_loss, cca_loss, cross_contrastive_loss
-from model.loss import contrastive_loss_cell, mae_loss_cell, infoNCE_loss
+from model.model import GraphEncoder, GIN_decoder
+from model.loss import contrastive_loss_cell, mae_loss_cell
 import torch.optim as optim
 import torch_geometric.transforms as T
 import torch.nn.functional as F

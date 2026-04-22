@@ -11,73 +11,24 @@ from torch_geometric.nn import TransformerConv, GPSConv, GINEConv, PNAConv, GINC
 
 from model.GWT_model import GraphWaveletTransform
 
-class HierarchicalBlending(nn.Module):
-    def __init__(self, 
-                 d_model: int, 
-                 n_heads: int = 1, 
-                 p: float = 0.5):
-        super().__init__()
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.p = p
-        
-        self.attn_high = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
-        self.attn_low  = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
 
-    def forward(self, high_emb, low_emb, batch):
-        device = high_emb.device
-
-        num_feats = high_emb.shape[1]
-        perm = torch.randperm(num_feats, device=device)
-        half = num_feats // 2
-        anchor1, anchor2 = perm[:half], perm[half:]
-
-        high_emb1 = high_emb.clone()
-        high_emb1[:, anchor1] = 0
-        high_emb2 = high_emb.clone()
-        high_emb2[:, anchor2] = 0
-
-        low_mask = torch.rand(low_emb.shape[0], device=device) < self.p
-        low_emb1 = low_emb.clone()
-        low_emb1[low_mask] = 0
-        low_emb2 = low_emb.clone()
-        low_emb2[~low_mask] = 0
-
-        global_low_emb2 = global_mean_pool(low_emb2, batch)
-
-        Q_high = high_emb1.unsqueeze(1)         # [B, 1, d_model]
-        K_high = global_low_emb2.unsqueeze(1)   # [B, 1, d_model]
-        V_high = global_low_emb2.unsqueeze(1)   # [B, 1, d_model]
-
-        attn_high_out, _ = self.attn_high(Q_high, K_high, V_high)
-        attn_high_out = attn_high_out.squeeze(1)
-
-        Q_low = low_emb1.unsqueeze(1)         # [N, 1, d_model]
-        K_low = high_emb2[batch].unsqueeze(1) # [N, 1, d_model]
-        V_low = high_emb2[batch].unsqueeze(1) # [N, 1, d_model]
-
-        attn_low_out, _ = self.attn_low(Q_low, K_low, V_low)
-        attn_low_out = attn_low_out.squeeze(1)  # => [N, d_model]
-
-        return attn_high_out, attn_low_out
+class MLP(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
+        super(MLP, self).__init__()
+        self.sf = nn.Softmax(dim=1)
+        if(num_layers==1):
+            self.layers = nn.ModuleList([nn.Linear(input_dim, output_dim)])
+        else:
+            self.layers = nn.ModuleList([nn.Linear(input_dim, hidden_dim)])
+            for i in range(num_layers-2):
+                self.layers.append(nn.Linear(hidden_dim, hidden_dim))
+            self.layers.append(nn.Linear(hidden_dim, output_dim))
     
-def HeirarchicalBlendingWavelet(high_level_subgraph, low_level_graphs, high_emb, low_emb, J):# -> tuple:# -> tuple:
-    num_genes = len(torch.where(low_level_graphs.batch==0)[0])
-    max_genes = []
-    for i in range(low_level_graphs.num_nodes//num_genes):
-        max_genes.append(torch.argmax(low_level_graphs.X[i*num_genes:(i+1)*num_genes].view(-1))+high_level_subgraph.num_nodes + i*num_genes)
-    new_edges = torch.stack([torch.arange(high_level_subgraph.num_nodes), torch.LongTensor(max_genes)])
-    new_edges = torch.cat([new_edges, torch.stack([new_edges[1], new_edges[0]])], 1).to(high_level_subgraph.X.device)
-    new_edge_index = torch.cat([high_level_subgraph.edge_index, new_edges, low_level_graphs.edge_index+high_level_subgraph.num_nodes],1)
-    new_edge_index = torch.cat([new_edge_index, torch.arange(high_level_subgraph.num_nodes + low_level_graphs.num_nodes).repeat(2,1).to(new_edge_index.device)], 1)
-    high_weights = (high_level_subgraph.X[high_level_subgraph.edge_index[0]] - high_level_subgraph.X[high_level_subgraph.edge_index[1]]).square().sum(1).pow(1/2)
-    high_weights = high_weights/high_weights.sum()
-    edge_weights = torch.cat([high_weights, torch.ones(2*high_level_subgraph.num_nodes, device = high_weights.device)*0.5, low_level_graphs.weight/low_level_graphs.weight.sum(), torch.ones(high_level_subgraph.num_nodes + low_level_graphs.num_nodes, device = high_weights.device)*0.5])
-    emb = torch.cat([high_emb, low_emb], 0)
-    gwt = GraphWaveletTransform(new_edge_index, edge_weights, emb, 4, high_weights.device)
-    emb = gwt.generate_timepoint_features()
-    return emb[:high_level_subgraph.num_nodes].float(), emb[high_level_subgraph.num_nodes:].float()
-
+    def forward(self, X):
+        for i in range(len(self.layers)-1):
+            X = F.relu(self.layers[i](X))
+        return self.layers[-1](X)
+        
 class GatingNetwork(nn.Module):
     def __init__(self, input_dim, num_experts):
         super(GatingNetwork, self).__init__()
@@ -183,57 +134,39 @@ class MultiLevelGraphLayer(nn.Module):
         self.conv_high = GINConv(nn.Linear(input_dim, output_dim), train_eps=True)
         self.multi_head = nn.MultiheadAttention(input_dim, num_heads, batch_first=True)
         self.conv_low = TransformerConv(input_dim, output_dim // num_heads, heads=num_heads)
-        # self.conv = GPSConv(input_dim, GINConv(nn.Linear(input_dim, output_dim), train_eps=True), heads=num_heads)
-        self.norm = nn.LayerNorm(output_dim)
+
+        self.norm_high_pre = nn.LayerNorm(output_dim)
+        self.norm_high_post = nn.LayerNorm(output_dim)
+        self.norm_low_pre = nn.LayerNorm(output_dim)
+        self.norm_low_post = nn.LayerNorm(output_dim)
+
+        self.MLP_high = MLP(output_dim, output_dim*4, output_dim, 3)
+        self.MLP_low = MLP(output_dim, output_dim*4, output_dim, 3)
+
         self.cross_message_passing = cross_message_passing
-        # self.attn_fclh = nn.Linear(output_dim * 2, 1, bias=False)
-        # self.attn_fchl = nn.Linear(output_dim * 2, 1, bias=False)
         self.cross_lh = CrossMessagePassing(output_dim)
         self.cross_hl = CrossMessagePassing(output_dim)
 
     def forward(self, high_emb_in, high_level_graph, low_emb_in, low_level_graphs):
-        high_emb = self.norm(high_emb_in)
-        low_emb = self.norm(low_emb_in)
+        high_emb_gin = self.conv_high(high_emb_in, high_level_graph.edge_index)
+        high_emb_mh, _ = self.multi_head(high_emb_in, high_emb_in, high_emb_in)
+        pre_high_emb = high_emb_mh + high_emb_gin
+        high_emb = self.norm_high_pre(pre_high_emb)
+        high_emb = self.MLP_high(high_emb)
+        high_emb += pre_high_emb
+        high_emb = self.norm_high_post(high_emb)
 
-        high_emb_gin = self.conv_high(high_emb, high_level_graph.edge_index)
-        high_emb_mh, _ = self.multi_head(high_emb, high_emb, high_emb)
-        high_emb = high_emb_mh + high_emb_gin #+ high_emb_in
-        
-        low_emb = self.conv_low(low_emb, low_level_graphs.edge_index) #+ low_emb_in
-        
+        pre_low_emb = self.conv_low(low_emb_in, low_level_graphs.edge_index)
+        low_emb = self.norm_low_pre(pre_low_emb)
+        low_emb = self.MLP_low(low_emb)
+        low_emb += pre_low_emb
+        low_emb = self.norm_low_post(low_emb)
+
         if(self.cross_message_passing):
-            # _high_emb = high_emb#.clone().requires_grad_()
             x = global_mean_pool(low_emb, low_level_graphs.batch)
             high_emb_per_node = high_emb[low_level_graphs.batch]  # (N_low_nodes, output_dim)
             _high_emb = self.cross_hl(high_emb, x)
             updated_low_emb = self.cross_lh(low_emb, high_emb_per_node)
-            # sim_score = torch.softmax(self.attn_fclh(torch.cat([_high_emb, x], dim=1)), dim=1)
-            # _high_emb = sim_score[:,0].view(high_level_graph.num_nodes,1) * _high_emb + sim_score[:,1].view(high_level_graph.num_nodes,1)  * x
-            # high_emb_per_node = high_emb[low_level_graphs.batch]  # (N_low_nodes, output_dim)
-            # concat_hl = torch.cat([low_emb, high_emb_per_node], dim=1)  # (N_low_nodes, 2 * output_dim)
-            # attn_scores_low = torch.softmax(self.attn_fchl(concat_hl), dim=1)  # (N_low_nodes, 1)
-            # updated_low_emb = attn_scores_low[:,0].view(low_level_graphs.num_nodes,1) * low_emb + attn_scores_low[:,1].view(low_level_graphs.num_nodes,1) * high_emb_per_node  # (N_low_nodes, output_dim)
-            
-            # sim_score = torch.sigmoid(self.attn_fclh(torch.cat([_high_emb, x], dim=1)))
-            # _high_emb = sim_score * _high_emb + (1 - sim_score) * x
-            
-            # # Gather high_emb[i] for each node in low_emb using the batch vector
-            # high_emb_per_node = high_emb[low_level_graphs.batch]  # (N_low_nodes, output_dim)
-            # # concat = torch.stack([low_emb, high_emb_per_node], dim=1)  # [N, 2, d_model]
-            # # scores = self.attn_fchl(concat.view(concat.shape[0], -1))  # [N, 1]
-            # # alpha = torch.softmax(torch.cat([scores, -scores], dim=1), dim=1)  # [N, 2]
-            # # # alpha = torch.softmax(self.attn_fchl(concat.view(concat.shape[0], -1)), dim=1)  # [N, 2]
-            # # updated_low_emb = alpha[:, 0:1] * low_emb + alpha[:, 1:2] * high_emb_per_node
-
-            # # Concatenate high_emb and low_emb
-            # concat_hl = torch.cat([low_emb, high_emb_per_node], dim=1)  # (N_low_nodes, 2 * output_dim)
-
-            # # Compute attention scores in batch
-            # attn_scores_low = torch.sigmoid(self.attn_fchl(concat_hl)+1)  # (N_low_nodes, 1)
-
-            # # Weighted update
-            # updated_low_emb = attn_scores_low * low_emb + (1 - attn_scores_low) * high_emb_per_node  # (N_low_nodes, output_dim)
-            # import pdb; pdb.set_trace()
-            return F.gelu(_high_emb), F.gelu(updated_low_emb)#, aux_loss_high+aux_loss_low
+            return F.gelu(_high_emb), F.gelu(updated_low_emb)
         else:
             return F.gelu(high_emb), F.gelu(low_emb)

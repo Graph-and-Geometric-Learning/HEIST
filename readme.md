@@ -101,3 +101,26 @@ This script will:
 
 * Evaluation results will be stored in the corresponding directories or logged to the console.
 * Ensure that the trained model checkpoint is available and named correctly (default: `HEIST`).
+
+---
+
+## License
+
+This work is licensed under a [Creative Commons Attribution 4.0 International License (CC BY 4.0)](https://creativecommons.org/licenses/by/4.0/).
+
+---
+
+## Citation
+
+If you find this work useful, please cite:
+
+```bibtex
+@inproceedings{
+madhu2026heist,
+title={{HEIST}: A Graph Foundation Model for Spatial Transcriptomics and Proteomics Data},
+author={Hiren Madhu and Jo{\~a}o Felipe Rocha and Tinglin Huang and Siddharth Viswanath and Smita Krishnaswamy and Rex Ying},
+booktitle={The Fourteenth International Conference on Learning Representations},
+year={2026},
+url={https://openreview.net/forum?id=lK82jpa8jr}
+}
+```

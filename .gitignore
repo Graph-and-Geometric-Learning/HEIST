@@ -25,3 +25,5 @@ calculate_rep_merfish_lung.py
 calculate_rep_spacegm.py
 playground.ipynb
 main_ddp_modular.py
+wandb
+.venv

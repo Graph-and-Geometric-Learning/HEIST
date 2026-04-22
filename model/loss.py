@@ -65,34 +65,7 @@ class AUCPRHingeLoss(nn.Module):
 
         return loss
 
-def infoNCE_loss(embedding_1, embedding_2, temperature=2):
-    # Normalize the embeddings to help stabilize similarity calculations
-    embedding_1 = F.normalize(embedding_1, dim=1)
-    embedding_2 = F.normalize(embedding_2, dim=1)
-
-    epsilon = 1e-8  # Small constant for numerical stability
-
-    # Compute similarity matrices
-    refl_sim1 = torch.mm(embedding_1, embedding_1.t()) / temperature
-    refl_sim2 = torch.mm(embedding_2, embedding_2.t()) / temperature
-    between_sim = torch.mm(embedding_1, embedding_2.t()) / temperature
-
-    # Compute the denominators with epsilon for numerical stability
-    denominator1 = refl_sim1.sum(1) + between_sim.sum(1) - refl_sim1.diag() + epsilon
-    denominator2 = refl_sim2.sum(1) + between_sim.sum(1) - refl_sim2.diag() + epsilon
-
-    # Ensure that the diagonal of between_sim is safe for log computation
-    safe_between_sim_diag = torch.clamp(between_sim.diag(), min=epsilon)
-
-    # Calculate the losses
-    loss1 = -torch.log(safe_between_sim_diag / denominator1).mean()
-    loss2 = -torch.log(safe_between_sim_diag / denominator2).mean()
-    
-    # Final loss is the average of both directions
-    loss = (loss1 + loss2) / 2
-    return loss
-
-def cross_contrastive_loss(z_1, z_2, cell_type, N, temperature=2):
+def cross_contrastive_loss(z_1, z_2, cell_type, N, temperature=0.5):
     # Normalize the embeddings
     z_1 = F.normalize(z_1, dim=1)
     z_2 = F.normalize(z_2, dim=1)
@@ -132,24 +105,6 @@ def cross_contrastive_loss(z_1, z_2, cell_type, N, temperature=2):
     loss /= batch_size
     return loss
 
-
-def cca_loss(z1, z2, lambd=0.5):
-        c = torch.mm(z1.T, z2)
-        c1 = torch.mm(z1.T, z1)
-        c2 = torch.mm(z2.T, z2)
-        N = z1.shape[0]
-        c = c / N
-        c1 = c1 / N
-        c2 = c2 / N
-
-        loss_inv = -torch.diagonal(c).sum()
-        iden = torch.tensor(np.eye(c.shape[0])).to(c.device)
-        loss_dec1 = (iden - c1).pow(2).sum()
-        loss_dec2 = (iden - c2).pow(2).sum()
-
-        loss = loss_inv + lambd * (loss_dec1 + loss_dec2)
-        return loss
-
 def contrastive_loss_cell(cell_types, high_emb, low_level_batch, low_emb, N):
     high_emb = F.normalize(high_emb, p=2, dim=-1)
     low_emb = F.normalize(low_emb, p=2, dim=-1)
@@ -174,11 +129,13 @@ def contrastive_loss_cell(cell_types, high_emb, low_level_batch, low_emb, N):
         if len(neg_idx) > 0:
             negative_indices.append(neg_idx[torch.randint(0, len(neg_idx), (N,))].tolist())
         else:
-            negative_indices.append([])
+            # No negatives for this cell type — fall back to all other cells
+            other_idx = torch.where(arange != i)[0]
+            negative_indices.append(other_idx[torch.randint(0, len(other_idx), (N,))].tolist())
 
     positive_indices = torch.LongTensor(positive_indices).to(device)
     negative_indices = torch.LongTensor(negative_indices).to(device)
-    
+
     positive_similarities_high = F.cosine_similarity(high_emb, high_emb[positive_indices]).clamp(min=1e-6)
     negative_similarities_high = F.cosine_similarity(high_emb.unsqueeze(1), high_emb[negative_indices], dim=-1)
     # high_level_loss = -torch.mean(
@@ -244,7 +201,8 @@ def contrastive_loss_cell_single_view(cell_types, high_emb, low_emb, N):
         if len(neg_idx) > 0:
             negative_indices.append(neg_idx[torch.randint(0, len(neg_idx), (N,))].tolist())
         else:
-            negative_indices.append([])
+            other_idx = torch.where(arange != i)[0]
+            negative_indices.append(other_idx[torch.randint(0, len(other_idx), (N,))].tolist())
 
     positive_indices = torch.LongTensor(positive_indices).to(device)
     negative_indices = torch.LongTensor(negative_indices).to(device)
