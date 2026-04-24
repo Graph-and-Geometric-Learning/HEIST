@@ -1,5 +1,4 @@
-conda init
-conda activate HEIST
+source .venv/bin/activate
 
 model_name="HEIST"
 echo "$model_name"

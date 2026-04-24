@@ -27,3 +27,4 @@ playground.ipynb
 main_ddp_modular.py
 wandb
 .venv
+upload_to_hf.py

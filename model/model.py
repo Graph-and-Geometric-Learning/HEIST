@@ -2,13 +2,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from huggingface_hub import PyTorchModelHubMixin
 from torch_geometric.nn import TransformerConv, GINConv
 from torch_geometric.nn.pool import global_mean_pool
 from model.layers import MultiLevelGraphLayer
 from model.pe import calculate_sinusoidal_pe
 
 
-class GraphEncoder(nn.Module):
+class GraphEncoder(
+    nn.Module,
+    PyTorchModelHubMixin,
+    repo_url="https://huggingface.co/HirenMadhu/HEIST",
+    pipeline_tag="feature-extraction",
+    license="mit",
+):
     def __init__(
         self,
         pe_dim,

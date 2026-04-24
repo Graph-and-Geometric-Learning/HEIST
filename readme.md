@@ -6,12 +6,28 @@ This project implements a distributed training pipeline for learning representat
 ---
 
 
-## Create and Activate Conda Environment
+## Setup
+
+This project uses [uv](https://docs.astral.sh/uv/) for dependency management.
+
+Install uv if you don't have it:
 
 ```bash
-conda env create -f environment.yml
-conda activate HEIST
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
+
+Then create the environment and install dependencies:
+
+```bash
+uv sync
+```
+
+This will create a `.venv/` in the project root with all dependencies from [pyproject.toml](pyproject.toml) / `uv.lock`. Prefix commands with `uv run` (e.g. `uv run python main_ddp.py ...`) or activate the venv directly:
+
+```bash
+source .venv/bin/activate
+```
+
 ---
 
 ## 📂 **Data Preparation**
@@ -61,6 +77,20 @@ python main.py --data_dir data/pretraining/ --pe --cross_message_passing
 
 ---
 
+## 🤗 **Loading Pre-trained Models from Hugging Face**
+
+Pre-trained HEIST checkpoints are hosted on the [Hugging Face Hub](https://huggingface.co/HirenMadhu). Load any of them with three lines:
+
+```python
+from model.model import GraphEncoder
+model = GraphEncoder.from_pretrained("HirenMadhu/HEIST").to(device)
+model.eval()
+```
+
+For an end-to-end tutorial on extracting cell embeddings from a pre-trained model — including preprocessing, graph construction, and visualization with PHATE — see [`cell_embeddings.ipynb`](cell_embeddings.ipynb).
+
+---
+
 ## 🛠 **Resuming Training**
 
 If you want to resume from a saved checkpoint, ensure that the model and optimizer state dictionaries are correctly loaded in the script.
@@ -80,7 +110,7 @@ bash eval.sh
 
 This script will:
 
-1. Initialize and activate the Conda environment `HEIST`.
+1. Activate the uv-managed `.venv` environment.
 2. Run a series of evaluations across multiple datasets and tasks:
 
    * **Representation Space Calculation**
