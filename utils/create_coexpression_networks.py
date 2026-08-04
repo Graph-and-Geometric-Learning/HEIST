@@ -83,12 +83,49 @@ def _mutual_information_binned_gpu(x, y, bins=32, eps=1e-12):
     MI = Hx + Hy - Hxy
     return MI
 
+@torch.no_grad()
+def _mutual_information_ksg_gpu(xi, xj, k=3, eps_noise=1e-10):
+    """
+    GPU Kraskov-Stoegbauer-Grassberger (KSG) estimator I for continuous-continuous MI,
+    matching sklearn.feature_selection.mutual_info_regression semantics.
+
+    xi, xj: (N, B) columns are the two variables of B candidate pairs over N samples.
+    Returns MI (B,), clamped >= 0.
+
+    For each pair/point: kth nearest-neighbor radius in the JOINT space under the
+    Chebyshev (max) metric, then marginal counts n_x, n_y of OTHER points strictly
+    within that radius; MI = psi(N) + psi(k) - <psi(n_x+1) + psi(n_y+1)>.
+    """
+    from torch.special import digamma
+    N, B = xi.shape
+    device = xi.device
+    # tie-breaking noise (as sklearn does): scale ~ 1e-10 * max(1, mean|x|)
+    xi = xi + eps_noise * xi.abs().mean(0, keepdim=True).clamp_min(1.0) * torch.randn_like(xi)
+    xj = xj + eps_noise * xj.abs().mean(0, keepdim=True).clamp_min(1.0) * torch.randn_like(xj)
+    xiT = xi.T.contiguous()                                  # (B, N)
+    xjT = xj.T.contiguous()
+    dxi = (xiT[:, :, None] - xiT[:, None, :]).abs()          # (B, N, N) x-marginal dists
+    dxj = (xjT[:, :, None] - xjT[:, None, :]).abs()          # (B, N, N) y-marginal dists
+    djoint = torch.maximum(dxi, dxj)                         # (B, N, N) Chebyshev joint
+    # kth neighbor EXCLUDING self = (k+1)th smallest including self (self dist = 0)
+    kth = torch.topk(djoint, k + 1, dim=2, largest=False).values[:, :, k]   # (B, N)
+    radius = torch.nextafter(kth, torch.zeros_like(kth))     # strictly-less radius (KSG)
+    nx = (dxi <= radius[:, :, None]).sum(dim=2) - 1          # (B, N) exclude self
+    ny = (dxj <= radius[:, :, None]).sum(dim=2) - 1
+    psiN = digamma(torch.tensor(float(N), device=device))
+    psik = digamma(torch.tensor(float(k), device=device))
+    mi = psiN + psik - (digamma((nx + 1).float()) + digamma((ny + 1).float())).mean(dim=1)
+    return mi.clamp_min(0.0)
+
+
 def build_gene_network_gpu(cell_data,
                            topk_per_gene=200,
                            min_abs_corr=None,
                            mi_bins=32,
                            mi_batch_size=20000,
-                           std_coeff = 1,
+                           ksg_k=3,
+                           ksg_batch=48,
+                           std_coeff=1.0,
                            device="cuda"):
     """
     cell_data: AnnData-like with .X sparse (cells x genes), .var.index as gene names
@@ -118,23 +155,26 @@ def build_gene_network_gpu(cell_data,
 
     all_mi = []
     edges_out = []
-    for start in range(0, P, mi_batch_size):
-        end = min(start + mi_batch_size, P)
+    # KSG builds a (B,N,N) tensor per batch, so batch over PAIRS in small chunks (ksg_batch),
+    # independent of mi_batch_size (which sized the old binned estimator).
+    for start in range(0, P, ksg_batch):
+        end = min(start + ksg_batch, P)
         batch = pairs[start:end]
-        xi = X[:, batch[:,0]]  # (Ncells, B)
-        xj = X[:, batch[:,1]]  # (Ncells, B)
-        mi = _mutual_information_binned_gpu(xi, xj, bins=mi_bins)  # (B,)
+        xi = X[:, batch[:, 0]]  # (Ncells, B)
+        xj = X[:, batch[:, 1]]  # (Ncells, B)
+        mi = _mutual_information_ksg_gpu(xi, xj, k=ksg_k)  # (B,) correct KSG estimator
         all_mi.append(mi)
         edges_out.append(batch)
 
     mi_all = torch.cat(all_mi, dim=0)  # (P,)
     edges_all = torch.cat(edges_out, dim=0)  # (P,2)
 
-    k = int(0.25 * mi_all.numel())
-    if k > 0:
-        topk_vals, topk_idx = torch.topk(mi_all, k=k, largest=True, sorted=False)
-        edges_keep = edges_all[topk_idx].detach().cpu().numpy()
-        mi_keep = topk_vals.detach().cpu().numpy()
+    # Adaptive edge selection: keep pairs with MI > mean(MI) + std_coeff * std(MI).
+    if mi_all.numel() >= 2:
+        thresh = mi_all.mean() + std_coeff * mi_all.std()
+        keep = mi_all > thresh
+        edges_keep = edges_all[keep].detach().cpu().numpy()
+        mi_keep = mi_all[keep].detach().cpu().numpy()
     else:
         edges_keep = np.empty((0, 2), dtype=int)
         mi_keep = np.empty((0,), dtype=float)

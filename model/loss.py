@@ -170,7 +170,11 @@ def contrastive_loss_cell(cell_types, high_emb, low_level_batch, low_emb, N):
     #     torch.log(positive_similarities_low + 1e-8) - torch.logsumexp(negative_similarities_low, dim=-1)
     # )
 
-    return (high_level_loss + cross_level_loss + low_level_loss) / num_cells
+    # Each component above is ALREADY a -torch.mean(...) over cells; dividing by num_cells again made
+    # this term ~1/num_cells too small (~3e-3 at 384 cells vs a reconstruction loss of order 1). With
+    # the learned sigmoid(alpha) blend — whose gradient drives alpha toward whichever term is SMALLER
+    # — that silently annihilated the reconstruction objective within ~1 epoch. Do not reintroduce it.
+    return high_level_loss + cross_level_loss + low_level_loss
 
 def mae_loss_cell(high_emb, low_emb, decoded_high, decoded_low, high_mask, low_mask):
     if(high_mask.sum()):
@@ -230,4 +234,8 @@ def contrastive_loss_cell_single_view(cell_types, high_emb, low_emb, N):
         torch.log(positive_similarities_low + 1e-8) - torch.logsumexp(negative_similarities_low, dim=-1)
     )
 
-    return (high_level_loss + cross_level_loss + low_level_loss) / num_cells
+    # Each component above is ALREADY a -torch.mean(...) over cells; dividing by num_cells again made
+    # this term ~1/num_cells too small (~3e-3 at 384 cells vs a reconstruction loss of order 1). With
+    # the learned sigmoid(alpha) blend — whose gradient drives alpha toward whichever term is SMALLER
+    # — that silently annihilated the reconstruction objective within ~1 epoch. Do not reintroduce it.
+    return high_level_loss + cross_level_loss + low_level_loss

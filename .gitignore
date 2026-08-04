@@ -28,3 +28,12 @@ main_ddp_modular.py
 wandb
 .venv
 upload_to_hf.py
+blca_heist/
+mioflow_heist/outputs/
+mioflow_heist/ortho_model/
+MIOFlow
+model/__pycache__
+utils/__pycache__
+mioflow_heist/__pycache__
+mioflow_blca/
+blca_heist_plan.md

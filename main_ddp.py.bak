@@ -12,7 +12,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torchinfo import summary
 import logging
-from utils.dataloader import create_dataloader, create_dataloader_ddp
+from utils.dataloader import create_dataloader_ddp
 from model.model import GraphEncoder, GIN_decoder
 from model.loss import contrastive_loss_cell, mae_loss_cell
 import torch.optim as optim
@@ -31,7 +31,7 @@ import socket
 from datetime import timedelta
 import wandb
 
-torch.autograd.set_detect_anomaly(os.environ.get('HEIST_DEBUG_ANOMALY','0')=='1')
+torch.autograd.set_detect_anomaly(True)
 
 def find_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -71,15 +71,12 @@ def validate(rank, world_size, model, decoder, val_idx, all_files, args):# -> An
     decoder.eval()
 
     total_val_loss = torch.tensor(0.0, device=device)
-    nb = 0
 
     with torch.no_grad():
         for graph_idx in tqdm(val_idx):
             graphs = torch.load(all_files[graph_idx], weights_only=False)
             try:
-                # NOT create_dataloader_ddp: its DistributedSampler shards by rank, so rank-0-only
-                # validation would score just 1/world_size of each file.
-                dataloader = create_dataloader(graphs, args.batch_size, permute=False)
+                dataloader = create_dataloader_ddp(graphs, args.batch_size, rank, world_size)
             except Exception as e:
                 logging.error("Dataloader creation failed.")
                 logging.error("Exception: %s", str(e))
@@ -90,27 +87,21 @@ def validate(rank, world_size, model, decoder, val_idx, all_files, args):# -> An
                 low_level_batch.batch_idx = batch_idx.to(device)
 
                 high_mask = 1 - torch.bernoulli(torch.ones(high_level_subgraph.num_nodes, 1)*0.2).long().to(device)
-                high_true_v, low_true_v = high_level_subgraph.X, low_level_batch.X   # BEFORE forward masks X
-                present = torch.where(low_level_batch.X.T[0])[0]   # .T[0]: X.T is [1,N]; where(2-D)[0] was all zeros
-                if len(present) == 0:
-                    continue
-                masked = present[torch.randint(0, len(present), (max(int(len(present)*0.2),1), 1))]
+                present = torch.where(low_level_batch.X.T)[0]
+                masked = present[torch.randint(0, len(present), (int(len(present)*0.2), 1))]
                 low_mask = torch.ones_like(low_level_batch.X).long().to(device)
                 low_mask[masked] = 0
-                high_emb, low_emb = model.module(high_level_subgraph, low_level_batch, high_mask, low_mask)
+                high_emb, low_emb = model(high_level_subgraph, low_level_batch, high_mask, low_mask)
 
                 contrastive_loss = contrastive_loss_cell(low_level_batch.cell_type, high_emb, low_level_batch, low_emb, 10)
 
                 _high_emb = high_emb * high_mask
                 _low_emb = low_emb * low_mask
-                decoded_high, decoded_low, alpha_sigmoid = decoder.module(_high_emb, high_level_subgraph, _low_emb, low_level_batch)
-                # Targets must be the PRE-mask values: forward() rebinds low_level_graphs.X = X*mask,
-                # so scoring against low_level_batch.X here measured 'predict zeros' and rewarded a
-                # degenerate model during checkpoint selection.
+                decoded_high, decoded_low, alpha_sigmoid = decoder(_high_emb, high_level_subgraph, _low_emb, low_level_batch)
                 if((1 - high_mask).sum()):
-                    recon_loss = F.mse_loss(decoded_high*(1-high_mask), high_true_v.float()*(1-high_mask), reduction='sum')/high_mask.sum() + F.mse_loss(decoded_low*(1-low_mask), low_true_v.float()*(1-low_mask), reduction='sum')/low_mask.sum()
+                    recon_loss = F.mse_loss(decoded_high*(1-high_mask), high_level_subgraph.X.float()*(1-high_mask), reduction='sum')/high_mask.sum() + F.mse_loss(decoded_low*(1-low_mask), low_level_batch.X.float()*(1-low_mask), reduction='sum')/low_mask.sum()
                 else:
-                    recon_loss = F.mse_loss(decoded_low*(1-low_mask), low_true_v.float()*(1-low_mask), reduction='sum')/low_mask.sum()
+                    recon_loss = F.mse_loss(decoded_low*(1-low_mask), low_level_batch.X.float()*(1-low_mask), reduction='sum')/low_mask.sum()
                                 
                 #orthogonal_loss = 0.1 * (F.normalize(_high_emb.T) @ F.normalize(_high_emb) - torch.eye(_high_emb.shape[1]).to(device)).square().mean() \
                 #               + 0.1 * (F.normalize(_low_emb.T) @ F.normalize(_low_emb) - torch.eye(_low_emb.shape[1]).to(device)).square().mean()
@@ -123,10 +114,8 @@ def validate(rank, world_size, model, decoder, val_idx, all_files, args):# -> An
                     gc.collect()
                     continue
                 total_val_loss += loss
-                nb += 1
 
-    model.train(); decoder.train()      # eval() was never undone -> dropout stayed off for good
-    return (total_val_loss / max(nb, 1)).item()   # mean, so it is comparable across runs
+    return total_val_loss.item()
 
 def train(rank, world_size, args):
     """Main training loop for DDP."""
@@ -144,39 +133,21 @@ def train(rank, world_size, args):
         all_files = sorted(glob(args.data_dir + "*/*"))
         train_idx, val_idx = train_test_split(np.arange(len(all_files)), test_size=0.2, random_state = 42)
 
-        # Shard in ONE place only. Previously ranks split FILES here AND partitions inside each
-        # file (DistributedSampler), so each rank saw ~1/world_size^2 of the cells and the union
-        # covered only ~1/world_size of the corpus per epoch. Unequal step counts also made DDP
-        # match allreduces across different steps.
-        train_idx_for_rank = train_idx
-        model = GraphEncoder(args.pe_dim, args.init_dim, args.hidden_dim, args.output_dim,
-                            args.num_layers, args.num_heads, args.cross_message_passing, args.pe,
-                            marker_embedding=args.marker_embedding,
-                            num_markers=args.num_markers).to(device)
+        train_idx_for_rank = train_idx[rank::world_size]#[121:]
+        model = GraphEncoder(args.pe_dim, args.init_dim, args.hidden_dim, args.output_dim, 
+                            args.num_layers, args.num_heads, args.cross_message_passing, args.pe).to(device)
         model.apply(initialize_weights)
         best_val_loss = float('inf')
-        start_epoch = 0
-        # Resume: without this a 48h wall or a REQUEUE loses everything, AND best_val_loss resets
-        # to inf so the restarted run's first (random-init) epoch overwrites the good checkpoint.
-        if args.resume and os.path.exists(args.resume):
-            ck = torch.load(args.resume, map_location=device, weights_only=False)
-            model.load_state_dict(ck['model_state_dict'])
-            best_val_loss = ck.get('best_val_loss', float('inf'))
-            start_epoch = ck.get('epoch', -1) + 1
-            print(f'Rank {rank}: resumed {args.resume} @ epoch {start_epoch} best={best_val_loss:.4f}')
+        # best_val_loss= checkpoint['best_val_loss']
 
         summary(model)
         model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=True)
-        decoder = GIN_decoder(args.output_dim, args.output_dim, nonneg_recon=args.nonneg_recon).to(device)
+        decoder = GIN_decoder(args.output_dim, args.output_dim).to(device)
         decoder.apply(initialize_weights)
         decoder = DDP(decoder, device_ids=[rank], output_device=rank, find_unused_parameters=True)
         optimizer = optim.AdamW(list(model.parameters())+list(decoder.parameters()), 
                                 lr=args.lr, weight_decay=args.wd)
-        if args.resume and os.path.exists(args.resume):
-            _ck = torch.load(args.resume, map_location=device, weights_only=False)
-            decoder.module.load_state_dict(_ck['decoder_state_dict'])
-            optimizer.load_state_dict(_ck['optimizer_state_dict'])
-        for epoch in range(start_epoch, args.num_epochs):
+        for epoch in range(args.num_epochs):
             start_time = time.time()
             total_loss = 0
             for graph_idx in tqdm(train_idx_for_rank, desc=f"Rank {rank} | Epoch {epoch}"):
@@ -212,11 +183,8 @@ def train(rank, world_size, args):
                     else:
                         recon_loss = F.mse_loss(decoded_low*(1-low_mask), low_true.float()*(1-low_mask), reduction='sum')/low_mask.sum()
                     
-                    # alpha is an nn.Parameter in the optimizer, so dL/dalpha = (C - R) drives it
-                    # toward whichever term is smaller -> it collapsed to one objective. Use fixed
-                    # weights and keep alpha only as a logged diagnostic.
-                    contrastive_component = args.w_contrastive * contrastive_loss
-                    recon_component = args.w_recon * recon_loss
+                    contrastive_component = alpha_sigmoid * contrastive_loss
+                    recon_component = (1 - alpha_sigmoid) * recon_loss
                     orthogonal_loss = 0.1 * (F.normalize(_high_emb.T) @ F.normalize(_high_emb) - torch.eye(_high_emb.shape[1]).to(device)).square().mean() \
                             + 0.1 * (F.normalize(_low_emb.T) @ F.normalize(_low_emb) - torch.eye(_low_emb.shape[1]).to(device)).square().mean()
 
@@ -260,12 +228,6 @@ def train(rank, world_size, args):
                         'best_val_loss':best_val_loss
                     }, args.save_path)
                     print(f"✅ New best model saved at Epoch {epoch+1} with Val Loss {val_loss:.4f}")
-                _last = args.save_path.replace('.pth', '_last.pth')
-                torch.save({'epoch': epoch, 'model_state_dict': model.module.state_dict(),
-                            'decoder_state_dict': decoder.module.state_dict(),
-                            'optimizer_state_dict': optimizer.state_dict(),
-                            'args': args, 'best_val_loss': best_val_loss}, _last + '.tmp')
-                os.replace(_last + '.tmp', _last)
                     
             # dist.barrier()
     finally:
@@ -292,12 +254,6 @@ if __name__ == "__main__":
     parser.add_argument('--num_epochs', type=int, default= 20, help="Number of epochs")
     parser.add_argument('--gpu', type=int, default= 0, help="GPU index")
     parser.add_argument('--save_path', type=str, default='saved_models/HEIST.pth', help="Path to save the best checkpoint")
-    parser.add_argument('--marker_embedding', action='store_true', help="Learn a per-marker embedding table")
-    parser.add_argument('--num_markers', type=int, default=None, help="Panel size for --marker_embedding")
-    parser.add_argument('--nonneg_recon', action='store_true', help="abs() the low recon (raw counts only)")
-    parser.add_argument('--w_contrastive', type=float, default=0.1, help="Fixed contrastive weight")
-    parser.add_argument('--w_recon', type=float, default=1.0, help="Fixed reconstruction weight")
-    parser.add_argument('--resume', type=str, default=None, help="Checkpoint to resume from")
     parser.add_argument('--wandb', action='store_true', help="Enable wandb logging (rank 0 only)")
     parser.add_argument('--run_name', type=str, default=None, help="wandb run name")
     args = parser.parse_args()

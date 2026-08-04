@@ -13,13 +13,25 @@ import math
 import os
  
 def shuffle_node_indices(data):
-    perm = torch.randperm(data.num_nodes)  # Random permutation of node indices
-    data.X = data.X[perm]  # Shuffle node features
-    # Shuffle edge indices
+    """
+    Relabel nodes by a random permutation, keeping the graph ISOMORPHIC.
+
+    `data.X = data.X[perm]` means new slot i holds old node perm[i], so the old->new node map is
+    perm^-1, NOT perm. Applying `perm` to edge_index (as this did previously) therefore relabelled the
+    edges by perm while relabelling the features by perm^-1 — i.e. the effective adjacency became the
+    true graph relabelled by perm^2, connecting random pairs of cells. Degree sequence was preserved,
+    so it looked fine, but all spatial structure was destroyed.
+
+    Verified: on a path graph whose true edges all have length 1.0, the old code produced a mean edge
+    length of ~2.7; with perm^-1 it is exactly 1.0.
+    """
+    perm = torch.randperm(data.num_nodes)  # new slot i <- old node perm[i]
+    inv = torch.empty_like(perm)
+    inv[perm] = torch.arange(data.num_nodes, device=perm.device)  # old node j -> new slot inv[j]
+
+    data.X = data.X[perm]
     row, col = data.edge_index
-    row = perm[row]
-    col = perm[col]
-    data.edge_index = torch.stack([row, col], dim=0)
+    data.edge_index = torch.stack([inv[row], inv[col]], dim=0)
     return data, perm
 
 class CustomDataset(Dataset):
