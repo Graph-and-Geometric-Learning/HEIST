@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from huggingface_hub import PyTorchModelHubMixin
 from torch_geometric.nn import TransformerConv, GINConv
 from torch_geometric.nn.pool import global_mean_pool
-from model.layers import MultiLevelGraphLayer
+from model.layers import MultiLevelGraphLayer, NicheAttention  # MLP re-exported for eval_*.py
 from model.pe import calculate_sinusoidal_pe
 
 
@@ -29,23 +29,20 @@ class GraphEncoder(
         *,
         marker_embedding=False,
         num_markers=None,
+        niche_attention=False,
+        num_niches=16,
+        niche_heads=4,
+        niche_detach=False,
+        niche_feat="low",
+        rank_pe_fixed=False,
     ):
-        """
-        marker_embedding / num_markers are KEYWORD-ONLY on purpose. Several stale call sites
-        (main.py:128, calculate_rep.py:73, eval_gene_imputation_fine_tune.py:83) already pass 10
-        POSITIONAL args to this 8-parameter signature, which raises a loud TypeError today. If these
-        were positional they would instead silently bind args.anchor_pe -> marker_embedding and
-        args.blending -> num_markers. Keyword-only params are still captured by
-        PyTorchModelHubMixin.__new__, so config serialisation is unaffected, and omitting them from a
-        published config.json means from_pretrained() falls back to these defaults (no new module,
-        so the existing HirenMadhu/HEIST checkpoint still loads unchanged).
-        """
         super().__init__()
         self.pe_dim = pe_dim
         self.positional_encoding = positional_encoding
         self.cross_message_passing = cross_message_passing
         self.marker_embedding = marker_embedding
         self.num_markers = num_markers
+        self.rank_pe_fixed = rank_pe_fixed
 
         # Input projections (pe_dim when using PE with addition, otherwise raw input dim)
         high_in_dim = pe_dim if positional_encoding else 2
@@ -57,18 +54,9 @@ class GraphEncoder(
             if num_markers is None:
                 raise ValueError("marker_embedding=True requires num_markers")
             if not positional_encoding:
-                # low_in_dim would be 1, but the embedding is pe_dim wide.
                 raise ValueError("marker_embedding=True requires positional_encoding=True")
-            # Factorised marker token (scGPT/Geneformer style): an IDENTITY vector plus a per-marker
-            # VALUE direction. The previous `X + pe` broadcast one scalar across all pe_dim channels,
-            # so through mlp_low the expression value occupied a single fixed direction SHARED by
-            # every marker — the model had no per-marker way to represent magnitude.
             self.marker_id_emb = nn.Embedding(num_markers, pe_dim)
-            self.marker_val_emb = nn.Embedding(num_markers, pe_dim)
             nn.init.normal_(self.marker_id_emb.weight, std=0.02)
-            nn.init.normal_(self.marker_val_emb.weight, std=0.02)
-            # Learned [MASK] token: multiplicative masking sets a value to 0.0, which for z-scored
-            # input is the MODE, so the model cannot tell a masked entry from an average one.
             self.mask_token = nn.Parameter(torch.zeros(pe_dim))
             nn.init.normal_(self.mask_token, std=0.02)
 
@@ -82,17 +70,22 @@ class GraphEncoder(
         self.final_norm = nn.LayerNorm(output_dim)
         self.projection_head = nn.Sequential(nn.Linear(output_dim, output_dim), nn.GELU())
 
+        self.niche_attention = niche_attention
+        self.num_niches = num_niches
+        self.niche_feat = niche_feat
+        if niche_feat == "markers" and num_markers is None:
+            raise ValueError("niche_feat='markers' requires num_markers (the panel size)")
+        _nf_dim = {"high": output_dim, "low": output_dim,
+                   "concat": 2 * output_dim, "markers": num_markers}[niche_feat]
+        self.niche = (
+            NicheAttention(_nf_dim, num_niches=num_niches, num_heads=niche_heads,
+                           detach=niche_detach, out_dim=output_dim)
+            if niche_attention
+            else None
+        )
+
     @staticmethod
     def _marker_ids(low_level_graphs):
-        """
-        Within-cell node position == marker index, derived from the batch vector.
-
-        Node order is guaranteed marker-aligned: GRNs are built with add_nodes_from(range(n_markers))
-        and X is reshaped in column order, and shuffle_node_indices only ever permutes the HIGH-level
-        graph. Derived rather than stored so no cached .pt graph needs regenerating.
-        Uses bincount, NOT `ptr` — the DataLoader(batch_size=1) re-collation in utils/dataloader.py
-        drops `ptr`.
-        """
         batch = low_level_graphs.batch
         mid = getattr(low_level_graphs, "marker_id", None)
         if mid is not None:
@@ -106,7 +99,8 @@ class GraphEncoder(
 
         if self.positional_encoding:
             high_level_graph, low_level_graphs = calculate_sinusoidal_pe(
-                high_level_graph, low_level_graphs, self.pe_dim
+                high_level_graph, low_level_graphs, self.pe_dim,
+                rank_pe_fixed=getattr(self, "rank_pe_fixed", False),
             )
             high_level_graph.pe = high_level_graph.pe.to(device)
             low_level_graphs.pe = low_level_graphs.pe.to(device)
@@ -122,8 +116,13 @@ class GraphEncoder(
             low_emb = low_level_graphs.X.float() + low_level_graphs.pe.float()
             if self.marker_embedding:
                 mid = self._marker_ids(low_level_graphs)
-                x = low_level_graphs.X.float().view(-1, 1)
-                low_emb = low_emb + self.marker_id_emb(mid) + self.marker_val_emb(mid) * x
+                if int(mid.max()) >= self.num_markers:
+                    raise ValueError(
+                        f"marker index {int(mid.max())} >= num_markers={self.num_markers}. "
+                        f"The batch has cells with {int(mid.max()) + 1} markers -- check that "
+                        f"--data_dir points at ONE cohort (charville=40, dfci=41, upmc=22)."
+                    )
+                low_emb = low_emb + self.marker_id_emb(mid)   # = x + rank_pe + gene identity
                 lm = getattr(low_level_graphs, "_low_mask", None)
                 if lm is not None:                      # learned [MASK] token at masked positions
                     lm = lm.view(-1, 1).float()
@@ -144,68 +143,52 @@ class GraphEncoder(
 
         return self.final_norm(high_emb), self.final_norm(low_emb)
   
-    def forward(self, high_level_graph, low_level_graphs, high_mask=None, low_mask=None):
+    def _apply_niche(self, high_emb, low_emb, high_level_graph, low_level_graphs, pos):
+        if self.niche is None:
+            return high_emb, None
+        if self.niche_feat == "markers":
+            feat = self._raw_markers
+        else:
+            pooled = global_mean_pool(low_emb, low_level_graphs.batch)
+            feat = {"high": high_emb,
+                    "low": pooled,
+                    "concat": torch.cat([high_emb, pooled], dim=1)}[self.niche_feat]
+        return self.niche(feat, pos, high_level_graph.edge_index, h=high_emb)
+
+    def _capture_markers(self, low_level_graphs):
+        if self.niche_feat != "markers" or self.niche is None:
+            return None
+        n_mk = int(torch.bincount(low_level_graphs.batch).max())
+        return low_level_graphs.X.view(-1, n_mk).float().detach().clone()
+
+    def forward(self, high_level_graph, low_level_graphs, high_mask=None, low_mask=None,
+                return_niche=False):
+        pos = high_level_graph.X.float()
+        self._raw_markers = self._capture_markers(low_level_graphs)
         if high_mask is not None and low_mask is not None:
             high_level_graph.X = high_level_graph.X * high_mask
             low_level_graphs.X = low_level_graphs.X * low_mask
-            # Stash the mask so _prepare_inputs can substitute a learned [MASK] token. This MUST be
-            # applied inside forward(): touching self.mask_token / marker embeddings from the training
-            # loop would put them outside the autograd graph DDP traverses from forward()'s output,
-            # so with find_unused_parameters=True their gradients would never be synchronised and the
-            # tables would silently diverge across ranks.
             low_level_graphs._low_mask = low_mask
 
         high_emb, low_emb = self._prepare_inputs(high_level_graph, low_level_graphs)
         high_emb, low_emb = self.mlp_high(high_emb), self.mlp_low(low_emb)
         high_emb, low_emb = self._run_conv_layers(high_emb, high_level_graph, low_emb, low_level_graphs)
-        return self.projection_head(high_emb), self.projection_head(low_emb)
+        high_emb, S = self._apply_niche(high_emb, low_emb, high_level_graph, low_level_graphs, pos)
+        out = (self.projection_head(high_emb), self.projection_head(low_emb))
+        return (*out, S) if return_niche else out
 
-    def encode(self, high_level_graph, low_level_graphs, gene_mask=None):
+    def encode(self, high_level_graph, low_level_graphs, gene_mask=None, return_niche=False):
+        pos = high_level_graph.X.float()
+        self._raw_markers = self._capture_markers(low_level_graphs)
         if gene_mask is not None:
             low_level_graphs.X = low_level_graphs.X * gene_mask
 
         high_emb, low_emb = self._prepare_inputs(high_level_graph, low_level_graphs)
         high_emb, low_emb = self.mlp_high(high_emb), self.mlp_low(low_emb)
 
-        return self._run_conv_layers(high_emb, high_level_graph, low_emb, low_level_graphs)
-
-
-class MLP(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
-        super().__init__()
-        if num_layers == 1:
-            self.layers = nn.ModuleList([nn.Linear(input_dim, output_dim)])
-        else:
-            self.layers = nn.ModuleList([nn.Linear(input_dim, hidden_dim)])
-            for _ in range(num_layers - 2):
-                self.layers.append(nn.Linear(hidden_dim, hidden_dim))
-            self.layers.append(nn.Linear(hidden_dim, output_dim))
-
-    def forward(self, X):
-        for i in range(len(self.layers) - 1):
-            X = F.relu(self.layers[i](X))
-        return self.layers[-1](X)
-
-
-class MLP_multihead(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim1, output_dim2, num_layers):
-        super().__init__()
-        self.bn = nn.BatchNorm1d(input_dim)
-        if num_layers == 1:
-            self.layers = nn.ModuleList([nn.Linear(input_dim, output_dim1)])
-            self.layers.append(nn.Linear(input_dim, output_dim2))
-        else:
-            self.layers = nn.ModuleList([nn.Linear(input_dim, hidden_dim)])
-            for _ in range(num_layers - 2):
-                self.layers.append(nn.Linear(hidden_dim, hidden_dim))
-            self.layers.append(nn.Linear(hidden_dim, output_dim1))
-            self.layers.append(nn.Linear(hidden_dim, output_dim2))
-
-    def forward(self, X, batch):
-        X = self.bn(X)
-        for i in range(len(self.layers) - 2):
-            X = F.relu(self.layers[i](X))
-        return global_mean_pool(self.layers[-2](X), batch), self.layers[-1](X)
+        high_emb, low_emb = self._run_conv_layers(high_emb, high_level_graph, low_emb, low_level_graphs)
+        high_emb, S = self._apply_niche(high_emb, low_emb, high_level_graph, low_level_graphs, pos)
+        return (high_emb, low_emb, S) if return_niche else (high_emb, low_emb)
 
 
 class GIN_decoder(nn.Module):
@@ -220,9 +203,9 @@ class GIN_decoder(nn.Module):
         """
         super().__init__()
         self.nonneg_recon = nonneg_recon
-        self.layers = nn.ModuleList([GINConv(nn.Linear(input_dim, hidden_dim), train_eps=True)])
+        self.layers = nn.ModuleList([GINConv(nn.Linear(input_dim, hidden_dim), train_eps=True, aggr='mean')])
         for _ in range(num_layers - 1):
-            self.layers.append(GINConv(nn.Linear(hidden_dim, hidden_dim), train_eps=True))
+            self.layers.append(GINConv(nn.Linear(hidden_dim, hidden_dim), train_eps=True, aggr='mean'))
         self.high_mlp = nn.Linear(hidden_dim, 2)
         self.low_mlp = nn.Linear(hidden_dim, 1)
         self.alpha = nn.Parameter(torch.tensor(0.0))
@@ -239,40 +222,3 @@ class GIN_decoder(nn.Module):
             low_emb = torch.abs(low_emb)
         alpha = torch.sigmoid(self.alpha)
         return high_emb, low_emb, alpha
-
-
-class GIN(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
-        super().__init__()
-        self.layers = nn.ModuleList([GINConv(nn.Linear(input_dim, hidden_dim), train_eps=True)])
-        for _ in range(num_layers - 2):
-            self.layers.append(GINConv(nn.Linear(hidden_dim, hidden_dim), train_eps=True))
-        self.layers.append(nn.Linear(hidden_dim, output_dim))
-        self.batch_norm = nn.BatchNorm1d(input_dim)
-
-    def forward(self, x, edge_index, batch):
-        x = self.batch_norm(x)
-        for i in range(len(self.layers) - 1):
-            x = self.layers[i](x, edge_index).relu()
-        x = F.dropout(x, p=0.5, training=self.training)
-        x = self.layers[-1](x)
-        return x
-
-
-class GraphTrans(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, num_heads, num_layers):
-        super().__init__()
-        self.layers = nn.ModuleList([TransformerConv(input_dim, hidden_dim // num_heads, heads=num_heads)])
-        for _ in range(num_layers - 2):
-            self.layers.append(nn.LayerNorm(hidden_dim))
-            self.layers.append(TransformerConv(hidden_dim, hidden_dim // num_heads, heads=num_heads))
-        self.layers.append(nn.Linear(hidden_dim, output_dim))
-
-    def forward(self, x, edge_index, batch):
-        x = self.layers[0](x, edge_index)
-        for i in range(1, len(self.layers) - 1, 2):
-            x = self.layers[i](x)
-            x = self.layers[i + 1](x, edge_index).relu()
-        x = F.dropout(x, p=0.5, training=self.training)
-        x = self.layers[-1](x)
-        return x

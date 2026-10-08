@@ -2,7 +2,7 @@ import torch
 
 import torch
 
-def calculate_sinusoidal_pe(high_level_graph, low_level_graphs, pe_dim):
+def calculate_sinusoidal_pe(high_level_graph, low_level_graphs, pe_dim, rank_pe_fixed=False):
     # Step 1: Calculate cell positional encodings (Dist_i)
     num_nodes = high_level_graph.num_nodes
     cell_locations = high_level_graph.X  # Shape: [num_cells, 2]
@@ -49,10 +49,19 @@ def calculate_sinusoidal_pe(high_level_graph, low_level_graphs, pe_dim):
         batch_rank_norm = torch.linspace(0, 1, steps=batch_ranks.size(0), device=batch_gene_expressions.device)
         rank_norm[torch.where(batch_mask)[0]] = batch_rank_norm[torch.argsort(batch_ranks)]
 
-    div_term = 10000 * (2 * torch.arange(0, pe_dim, 2, device=rank_norm.device).float() /half_dim)
+    if rank_pe_fixed:
+        n_per = torch.bincount(gene_batches)[gene_batches].float().to(rank_norm.device)
+        rank = rank_norm * (n_per - 1).clamp_min(1)
+        div_term = torch.exp(torch.arange(0, pe_dim, 2, device=rank.device).float()
+                             * -(torch.log(torch.tensor(10000.0)) / pe_dim))
+        pos = rank
+    else:
+        # Legacy (published HirenMadhu/HEIST checkpoint). Kept bit-identical so it still loads.
+        div_term = 10000 * (2 * torch.arange(0, pe_dim, 2, device=rank_norm.device).float() /half_dim)
+        pos = rank_norm
     gene_sinusoidal_pe = torch.zeros(rank_norm.size(0), pe_dim, device=rank_norm.device)
-    gene_sinusoidal_pe[:, 0::2] = torch.sin(rank_norm.unsqueeze(-1) * div_term)
-    gene_sinusoidal_pe[:, 1::2] = torch.cos(rank_norm.unsqueeze(-1) * div_term)
+    gene_sinusoidal_pe[:, 0::2] = torch.sin(pos.unsqueeze(-1) * div_term)
+    gene_sinusoidal_pe[:, 1::2] = torch.cos(pos.unsqueeze(-1) * div_term)
     # Set low-level graph PE
     low_level_graphs.pe = gene_sinusoidal_pe.to(high_level_graph.X.device)
 

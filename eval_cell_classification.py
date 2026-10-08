@@ -8,23 +8,12 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score
 import torch.nn as nn
 import torch.optim as optim
+from model.layers import MLP
 from tqdm import tqdm
 
 model_name = sys.argv[1]
-class MLP(nn.Module):
-    def __init__(self, input_dim, num_classes):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, num_classes)
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
 def train_mlp(X_train, y_train, X_val, y_val, input_dim, num_classes, device):
-    model = MLP(input_dim, num_classes).to(device)
+    model = MLP(input_dim, 128, num_classes, 2).to(device)  # Linear-ReLU-Linear, as before
     optimizer = optim.Adam(model.parameters(), lr=1e-2)
     criterion = nn.CrossEntropyLoss()
 

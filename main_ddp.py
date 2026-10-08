@@ -14,7 +14,8 @@ from torchinfo import summary
 import logging
 from utils.dataloader import create_dataloader, create_dataloader_ddp
 from model.model import GraphEncoder, GIN_decoder
-from model.loss import contrastive_loss_cell, mae_loss_cell
+from model.loss import (contrastive_loss_cell, mae_loss_cell, niche_cut_loss, niche_balance_loss,
+                        niche_ortho_loss)
 import torch.optim as optim
 import torch_geometric.transforms as T
 import torch.nn.functional as F
@@ -40,7 +41,9 @@ def find_free_port():
 
 def setup(rank, world_size):
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "29500"  # Set a free port for communication
+    # Was hardcoded, which makes two concurrent jobs landing on the SAME node collide on rendezvous.
+    # Arm A and Arm B run at the same time, so let the launcher pass a distinct port.
+    os.environ["MASTER_PORT"] = os.environ.get("HEIST_MASTER_PORT", "29500")
     os.environ["NCCL_IB_DISABLE"] = "1"
     dist.init_process_group("nccl",  timeout=timedelta(minutes=180), rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
@@ -97,7 +100,8 @@ def validate(rank, world_size, model, decoder, val_idx, all_files, args):# -> An
                 masked = present[torch.randint(0, len(present), (max(int(len(present)*0.2),1), 1))]
                 low_mask = torch.ones_like(low_level_batch.X).long().to(device)
                 low_mask[masked] = 0
-                high_emb, low_emb = model.module(high_level_subgraph, low_level_batch, high_mask, low_mask)
+                high_emb, low_emb, niche_S = model.module(high_level_subgraph, low_level_batch,
+                                                          high_mask, low_mask, return_niche=True)
 
                 contrastive_loss = contrastive_loss_cell(low_level_batch.cell_type, high_emb, low_level_batch, low_emb, 10)
 
@@ -116,6 +120,12 @@ def validate(rank, world_size, model, decoder, val_idx, all_files, args):# -> An
                 #               + 0.1 * (F.normalize(_low_emb.T) @ F.normalize(_low_emb) - torch.eye(_low_emb.shape[1]).to(device)).square().mean()
 
                 loss = alpha_sigmoid * contrastive_loss + (1 - alpha_sigmoid) * recon_loss #+ orthogonal_loss
+                # Mirror the niche terms from training. Checkpoint selection is driven by this
+                # number, so omitting them would select for a model that ignores the niche head.
+                if niche_S is not None:
+                    loss = loss + args.w_niche_cut * niche_cut_loss(niche_S, high_level_subgraph.edge_index) \
+                                + args.w_niche_ortho * niche_ortho_loss(niche_S) \
+                                + args.w_niche_balance * niche_balance_loss(niche_S)
                 # loss = contrastive_loss
                 if torch.isnan(loss) or not torch.isfinite(loss):
                     print(f"Rank {rank}: NaN loss encountered, skipping")
@@ -126,7 +136,14 @@ def validate(rank, world_size, model, decoder, val_idx, all_files, args):# -> An
                 nb += 1
 
     model.train(); decoder.train()      # eval() was never undone -> dropout stayed off for good
-    return (total_val_loss / max(nb, 1)).item()   # mean, so it is comparable across runs
+    if nb == 0:
+        # Every batch was skipped -- the model is degenerate (typically all-NaN weights). Returning
+        # 0.0 here (the old `max(nb,1)` behaviour) made a dead model score BETTER than any healthy
+        # one and win checkpoint selection: job 23872253 saved a 421/421-NaN checkpoint as "best"
+        # with val 0.0. inf makes it unselectable.
+        print(f"Rank {rank}: validation produced no finite batches -> val loss inf")
+        return float('inf')
+    return (total_val_loss / nb).item()   # mean, so it is comparable across runs
 
 def train(rank, world_size, args):
     """Main training loop for DDP."""
@@ -135,7 +152,15 @@ def train(rank, world_size, args):
 
     wandb_run = None
     if rank == 0 and args.wandb:
-        wandb_run = wandb.init(project="HEIST", name=args.run_name, config=vars(args))
+        # Never let logging kill training. `wandb` in this venv is an EMPTY namespace package
+        # (wandb.__file__ is None, no .init), so this call raised AttributeError on rank 0, which
+        # tore down the TCPStore and made every other rank die in DDP() with an unrelated-looking
+        # NCCL rendezvous error. Cost one job and a confusing traceback; not again.
+        try:
+            wandb_run = wandb.init(project="HEIST", name=args.run_name, config=vars(args))
+        except Exception as e:
+            print(f"[warn] wandb disabled ({type(e).__name__}: {e}); continuing without it", flush=True)
+            wandb_run = None
 
     try:
         device = torch.device(f"cuda:{rank}")
@@ -152,7 +177,13 @@ def train(rank, world_size, args):
         model = GraphEncoder(args.pe_dim, args.init_dim, args.hidden_dim, args.output_dim,
                             args.num_layers, args.num_heads, args.cross_message_passing, args.pe,
                             marker_embedding=args.marker_embedding,
-                            num_markers=args.num_markers).to(device)
+                            num_markers=args.num_markers,
+                            niche_attention=args.niche_attention,
+                            num_niches=args.num_niches,
+                            niche_heads=args.niche_heads,
+                            niche_detach=args.niche_detach,
+                            niche_feat=args.niche_feat,
+                            rank_pe_fixed=args.rank_pe_fixed).to(device)
         model.apply(initialize_weights)
         best_val_loss = float('inf')
         start_epoch = 0
@@ -179,6 +210,9 @@ def train(rank, world_size, args):
         for epoch in range(start_epoch, args.num_epochs):
             start_time = time.time()
             total_loss = 0
+            nonfinite_steps = 0
+            total_steps = 0
+            niche_cut_sum, niche_ortho_sum, niche_ent_sum, niche_sharp_sum, niche_n = 0.0, 0.0, 0.0, 0.0, 0
             for graph_idx in tqdm(train_idx_for_rank, desc=f"Rank {rank} | Epoch {epoch}"):
                 graphs = torch.load(all_files[graph_idx], weights_only=False)
                 try:
@@ -202,7 +236,8 @@ def train(rank, world_size, args):
                     low_mask[masked] = 0
                     # low_mask = 1 - torch.bernoulli(torch.ones(low_level_batch.num_nodes, 1)*0.2).long().to(device)
 
-                    high_emb, low_emb = model(high_level_subgraph, low_level_batch, high_mask, low_mask)
+                    high_emb, low_emb, niche_S = model(high_level_subgraph, low_level_batch,
+                                                       high_mask, low_mask, return_niche=True)
                     contrastive_loss = contrastive_loss_cell(low_level_batch.cell_type, high_emb, low_level_batch, low_emb, 16)
                     _high_emb = high_emb * high_mask
                     _low_emb = low_emb * low_mask
@@ -212,15 +247,25 @@ def train(rank, world_size, args):
                     else:
                         recon_loss = F.mse_loss(decoded_low*(1-low_mask), low_true.float()*(1-low_mask), reduction='sum')/low_mask.sum()
                     
-                    # alpha is an nn.Parameter in the optimizer, so dL/dalpha = (C - R) drives it
-                    # toward whichever term is smaller -> it collapsed to one objective. Use fixed
-                    # weights and keep alpha only as a logged diagnostic.
                     contrastive_component = args.w_contrastive * contrastive_loss
                     recon_component = args.w_recon * recon_loss
                     orthogonal_loss = 0.1 * (F.normalize(_high_emb.T) @ F.normalize(_high_emb) - torch.eye(_high_emb.shape[1]).to(device)).square().mean() \
                             + 0.1 * (F.normalize(_low_emb.T) @ F.normalize(_low_emb) - torch.eye(_low_emb.shape[1]).to(device)).square().mean()
 
                     loss = contrastive_component + recon_component + orthogonal_loss
+
+                    if niche_S is not None:
+                        cut = niche_cut_loss(niche_S, high_level_subgraph.edge_index)
+                        ortho = niche_ortho_loss(niche_S)
+                        bal = niche_balance_loss(niche_S)
+                        loss = loss + args.w_niche_cut * cut + args.w_niche_ortho * ortho \
+                                    + args.w_niche_balance * bal
+                        niche_cut_sum += cut.item()
+                        niche_ortho_sum += ortho.item()
+                        niche_ent_sum += -bal.item()
+                        niche_sharp_sum += niche_S.max(-1).values.mean().item()
+                        niche_n += 1
+
                     if torch.isnan(loss) or not torch.isfinite(loss):
                         print(f"Rank {rank}: NaN loss encountered, skipping")
                         print(f"Contra: {contrastive_loss.item():.4f}, Recon: {recon_loss.item():.4f}")#, Ortho: {orthogonal_loss.item():.4f}")
@@ -228,16 +273,41 @@ def train(rank, world_size, args):
                         gc.collect()
                         continue                       
                     loss.backward()
+                    total_steps += 1
+                    if args.clip_grad > 0:
+                        gn_m = torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+                        gn_d = torch.nn.utils.clip_grad_norm_(decoder.parameters(), args.clip_grad)
+                        if not (torch.isfinite(gn_m) and torch.isfinite(gn_d)):
+                            optimizer.zero_grad(set_to_none=True)
+                            nonfinite_steps += 1
+                            continue
                     optimizer.step()
                     total_loss += loss.item()
-                    # logging.error(f"Rank {rank}: Loss = {loss.item()}, Total loss = {total_loss}")
-                    del high_level_subgraph, low_level_batch, loss, high_emb, low_emb, contrastive_loss, high_mask, low_mask, _high_emb, _low_emb, recon_loss
+                    del high_level_subgraph, low_level_batch, loss, high_emb, low_emb, contrastive_loss, high_mask, low_mask, _high_emb, _low_emb, recon_loss, niche_S
                 del dataloader
                 torch.cuda.empty_cache()
                 gc.collect()
 
             end_time = time.time()
             print(f"Rank {rank} - Epoch: {epoch + 1}, Loss: {total_loss}, Time = {(end_time-start_time)//3600} hours")
+            if nonfinite_steps:
+                # Rate, not just count: a burst the guard absorbs looks very different from a model
+                # that has stopped training. Watch this trend across epochs.
+                print(f"Rank {rank} - Epoch: {epoch + 1}, skipped {nonfinite_steps}/{total_steps} "
+                      f"non-finite-grad steps ({nonfinite_steps / max(total_steps, 1):.1%})")
+            # Fail loudly instead of no-oping. Once the weights are NaN every batch hits the skip path,
+            # so training silently does nothing: job 23872253 ran 23 h that way after dying in epoch 1.
+            _bad = [n for n, p in model.module.named_parameters() if not torch.isfinite(p).all()]
+            if _bad:
+                raise RuntimeError(
+                    f"Rank {rank}: model weights went non-finite in epoch {epoch + 1} "
+                    f"({len(_bad)} tensors, e.g. {_bad[:3]}). Aborting rather than burning walltime.")
+            if niche_n:
+                print(f"Rank {rank} - Epoch: {epoch + 1}, niche_cut={niche_cut_sum/niche_n:.4f}, "
+                      f"niche_ortho={niche_ortho_sum/niche_n:.4f}, "
+                      f"niche_usage_entropy={niche_ent_sum/niche_n:.4f}, "
+                      f"niche_sharpness={niche_sharp_sum/niche_n:.4f} "
+                      f"(sharpness ~ 1/K={1.0/args.num_niches:.4f} means the head learned nothing)")
             
             # dist.barrier()
             if rank == 0:  # Save only from rank 0
@@ -245,7 +315,13 @@ def train(rank, world_size, args):
                 print(f"[Validation] Epoch {epoch+1} | Rank {rank} | Val Loss: {val_loss:.4f} | Best Val Loss: {best_val_loss:.4f}")
 
                 if wandb_run is not None:
-                    wandb_run.log({"epoch": epoch + 1, "train_loss": total_loss, "val_loss": val_loss}, step=epoch + 1)
+                    _log = {"epoch": epoch + 1, "train_loss": total_loss, "val_loss": val_loss}
+                    if niche_n:
+                        _log["niche_cut"] = niche_cut_sum / niche_n
+                        _log["niche_ortho"] = niche_ortho_sum / niche_n
+                        _log["niche_usage_entropy"] = niche_ent_sum / niche_n
+                        _log["niche_sharpness"] = niche_sharp_sum / niche_n
+                    wandb_run.log(_log, step=epoch + 1)
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
@@ -275,30 +351,41 @@ def train(rank, world_size, args):
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="HEIST")
-    parser.add_argument('--data_dir', type=str, default = 'data/pretraining/', help="Directory where the raw data is stored")
-    parser.add_argument('--pe_dim', type=int, default= 128, help="Dimension of the positional encodings")
-    parser.add_argument('--init_dim', type=int, default= 128, help="Hidden dim for the MLP")
-    parser.add_argument('--hidden_dim', type=int, default= 128, help="Hidden dim for the MLP")
-    parser.add_argument('--output_dim', type=int, default= 128, help="Output dim for the MLP")
-    parser.add_argument('--blending', action='store_true')
-    parser.add_argument('--pe', action='store_true')
-    parser.add_argument('--cross_message_passing', action='store_true')
-    parser.add_argument('--num_layers', type=int, default= 10, help="Number of MLP layers")
-    parser.add_argument('--num_heads', type=int, default= 8, help="Number of transformer heads")
-    parser.add_argument('--batch_size', type=int, default= 50, help="Batch size")
-    parser.add_argument('--graph_idx', type=int, default= 0, help="Batch size")
-    parser.add_argument('--lr', type=float, default= 1e-3, help="Learnign Rate")
-    parser.add_argument('--wd', type=float, default= 3e-3, help="Weight decay")
-    parser.add_argument('--num_epochs', type=int, default= 20, help="Number of epochs")
-    parser.add_argument('--gpu', type=int, default= 0, help="GPU index")
-    parser.add_argument('--save_path', type=str, default='saved_models/HEIST.pth', help="Path to save the best checkpoint")
-    parser.add_argument('--marker_embedding', action='store_true', help="Learn a per-marker embedding table")
-    parser.add_argument('--num_markers', type=int, default=None, help="Panel size for --marker_embedding")
-    parser.add_argument('--nonneg_recon', action='store_true', help="abs() the low recon (raw counts only)")
-    parser.add_argument('--w_contrastive', type=float, default=0.1, help="Fixed contrastive weight")
-    parser.add_argument('--w_recon', type=float, default=1.0, help="Fixed reconstruction weight")
+    parser.add_argument('--data_dir', type=str, default='data/pretraining/', help="Root with one subfolder of .pt chunks per source")
+    parser.add_argument('--pe_dim', type=int, default=128, help="Positional encoding dim")
+    parser.add_argument('--init_dim', type=int, default=128, help="Input projection dim")
+    parser.add_argument('--hidden_dim', type=int, default=128, help="Hidden dim of the graph layers")
+    parser.add_argument('--output_dim', type=int, default=128, help="Embedding dim")
+    parser.add_argument('--blending', action='store_true', help="Unused; kept for old launch scripts")
+    parser.add_argument('--pe', action='store_true', help="Use positional encodings")
+    parser.add_argument('--cross_message_passing', action='store_true', help="Cell-gene cross message passing")
+    parser.add_argument('--num_layers', type=int, default=10, help="Number of graph layers")
+    parser.add_argument('--num_heads', type=int, default=8, help="Transformer heads")
+    parser.add_argument('--batch_size', type=int, default=50, help="Cells per METIS partition")
+    parser.add_argument('--graph_idx', type=int, default=0, help="Unused")
+    parser.add_argument('--lr', type=float, default=1e-3, help="Learning rate")
+    parser.add_argument('--wd', type=float, default=3e-3, help="Weight decay")
+    parser.add_argument('--clip_grad', type=float, default=0.0, help="Max grad norm (0 = off)")
+    parser.add_argument('--num_epochs', type=int, default=20, help="Number of epochs")
+    parser.add_argument('--gpu', type=int, default=0, help="GPU index")
+    parser.add_argument('--save_path', type=str, default='saved_models/HEIST.pth', help="Best checkpoint path")
+    parser.add_argument('--rank_pe_fixed', action='store_true', help="Standard-frequency gene rank PE")
+    parser.add_argument('--marker_embedding', action='store_true', help="Learned per-gene embedding")
+    parser.add_argument('--num_markers', type=int, default=None, help="Gene vocab size for --marker_embedding")
+    parser.add_argument('--nonneg_recon', action='store_true', help="abs() the gene reconstruction")
+    parser.add_argument('--w_contrastive', type=float, default=0.1, help="Contrastive loss weight")
+    parser.add_argument('--w_recon', type=float, default=1.0, help="Reconstruction loss weight")
+    parser.add_argument('--niche_attention', action='store_true', help="Enable the niche head")
+    parser.add_argument('--num_niches', type=int, default=16, help="Number of niches")
+    parser.add_argument('--niche_heads', type=int, default=4, help="Neighbourhood bandwidths")
+    parser.add_argument('--niche_feat', type=str, default='low', choices=['low', 'high', 'concat', 'markers'],
+                        help="Niche input feature ('markers' transfers across regions)")
+    parser.add_argument('--niche_detach', action='store_true', help="Detach the niche head from the backbone")
+    parser.add_argument('--w_niche_cut', type=float, default=0.1, help="MinCut coherence weight")
+    parser.add_argument('--w_niche_ortho', type=float, default=0.5, help="MinCut orthogonality weight (keep > 0)")
+    parser.add_argument('--w_niche_balance', type=float, default=0.5, help="Anti-collapse weight (keep > 0)")
     parser.add_argument('--resume', type=str, default=None, help="Checkpoint to resume from")
-    parser.add_argument('--wandb', action='store_true', help="Enable wandb logging (rank 0 only)")
+    parser.add_argument('--wandb', action='store_true', help="wandb logging (rank 0)")
     parser.add_argument('--run_name', type=str, default=None, help="wandb run name")
     args = parser.parse_args()
 

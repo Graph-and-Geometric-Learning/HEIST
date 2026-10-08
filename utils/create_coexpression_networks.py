@@ -1,14 +1,10 @@
 import torch
 import numpy as np
 import networkx as nx
+from torch.special import digamma
 
 @torch.no_grad()
 def _corr_prefilter_gpu(X, topk=200, min_abs_r=None):
-    """
-    X: (cells, genes) float32 CUDA tensor (standardized)
-    Returns candidate pair indices (i_idx, j_idx) after correlation prefilter.
-    Use either topk per gene or an absolute threshold.
-    """
     # corrcoef wants (features, samples)
     G = X.shape[1]
     C = torch.corrcoef(X.T)  # (genes, genes), symmetric, diag=1
@@ -23,11 +19,12 @@ def _corr_prefilter_gpu(X, topk=200, min_abs_r=None):
     else:
         # topk per gene (symmetric dedup later)
         k = min(topk, G-1)
+        if k == G - 1:
+            i_idx, j_idx = torch.triu_indices(G, G, offset=1, device=X.device)
+            return i_idx, j_idx
         vals, idxs = torch.topk(C.abs(), k=k, dim=1, largest=True, sorted=False)  # per row (gene)
-        # Build candidate set (i, j) and dedup by i<j
         i_idx = torch.arange(G, device=X.device).repeat_interleave(k)
         j_idx = idxs.reshape(-1)
-        # Remove duplicates by always ordering (min, max) and unique
         a = torch.minimum(i_idx, j_idx)
         b = torch.maximum(i_idx, j_idx)
         pairs = torch.stack([a, b], dim=1)
@@ -36,17 +33,7 @@ def _corr_prefilter_gpu(X, topk=200, min_abs_r=None):
 
 @torch.no_grad()
 def _mutual_information_binned_gpu(x, y, bins=32, eps=1e-12):
-    """
-    x, y: (N, B) where B is number of pairs in the batch (each column a variable)
-    Returns MI for each column pair (B,)
-    Implementation detail:
-    - Compute bin indices (N,B) in [0, bins-1]
-    - Joint histogram via scatter_add into (B, bins*bins)
-    - Convert to probabilities and compute MI
-    """
     N, B = x.shape
-    # Bin edges per column: use global min/max per column
-    # Normalize to [0,1] first, then bucketize
     def _normalize(z):
         zmin = z.min(dim=0, keepdim=True).values
         zmax = z.max(dim=0, keepdim=True).values
@@ -85,21 +72,11 @@ def _mutual_information_binned_gpu(x, y, bins=32, eps=1e-12):
 
 @torch.no_grad()
 def _mutual_information_ksg_gpu(xi, xj, k=3, eps_noise=1e-10):
-    """
-    GPU Kraskov-Stoegbauer-Grassberger (KSG) estimator I for continuous-continuous MI,
-    matching sklearn.feature_selection.mutual_info_regression semantics.
-
-    xi, xj: (N, B) columns are the two variables of B candidate pairs over N samples.
-    Returns MI (B,), clamped >= 0.
-
-    For each pair/point: kth nearest-neighbor radius in the JOINT space under the
-    Chebyshev (max) metric, then marginal counts n_x, n_y of OTHER points strictly
-    within that radius; MI = psi(N) + psi(k) - <psi(n_x+1) + psi(n_y+1)>.
-    """
-    from torch.special import digamma
     N, B = xi.shape
     device = xi.device
-    # tie-breaking noise (as sklearn does): scale ~ 1e-10 * max(1, mean|x|)
+    xi = xi / xi.std(0, correction=0, keepdim=True).clamp_min(1e-12)
+    xj = xj / xj.std(0, correction=0, keepdim=True).clamp_min(1e-12)
+
     xi = xi + eps_noise * xi.abs().mean(0, keepdim=True).clamp_min(1.0) * torch.randn_like(xi)
     xj = xj + eps_noise * xj.abs().mean(0, keepdim=True).clamp_min(1.0) * torch.randn_like(xj)
     xiT = xi.T.contiguous()                                  # (B, N)
@@ -124,13 +101,9 @@ def build_gene_network_gpu(cell_data,
                            mi_bins=32,
                            mi_batch_size=20000,
                            ksg_k=3,
-                           ksg_batch=48,
+                           ksg_batch=None,
                            std_coeff=1.0,
                            device="cuda"):
-    """
-    cell_data: AnnData-like with .X sparse (cells x genes), .var.index as gene names
-    Returns: edges (np.ndarray Nx2), weights (np.ndarray N,), gene_names (list)
-    """
     # 1) Move to GPU
     import scipy.sparse as sp
     X = cell_data.X
@@ -155,8 +128,13 @@ def build_gene_network_gpu(cell_data,
 
     all_mi = []
     edges_out = []
-    # KSG builds a (B,N,N) tensor per batch, so batch over PAIRS in small chunks (ksg_batch),
-    # independent of mi_batch_size (which sized the old binned estimator).
+    if ksg_batch is None:
+        free, _ = torch.cuda.mem_get_info(X.device)
+        ksg_batch = max(1, int(0.7 * free / (5 * 4 * Ncells ** 2)))
+        # torch.topk on a (B,N,N) tensor with > 2^31 elements hits an int32 index overflow and dies
+        # with "CUDA error: an illegal memory access". Free memory alone allows that on B200 (180 GB):
+        # 6 of 93 v2 preprocessing tasks crashed this way, all on B200, all inside topk.
+        ksg_batch = max(1, min(ksg_batch, (2**31 - 1) // Ncells ** 2))
     for start in range(0, P, ksg_batch):
         end = min(start + ksg_batch, P)
         batch = pairs[start:end]

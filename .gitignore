@@ -37,3 +37,7 @@ utils/__pycache__
 mioflow_heist/__pycache__
 mioflow_blca/
 blca_heist_plan.md
+niche_heist/
+tests/test_niche_attention.py
+__pycache__/
+archive/
